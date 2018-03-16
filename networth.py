@@ -1,5 +1,5 @@
-import imaplib, email, json, requests
-from pprint import pprint
+import imaplib, json, requests, sys
+from datetime import datetime
 from config import *
 
 CAPITALONE_SUBJECT = "Your requested balance summary"
@@ -75,8 +75,10 @@ capitalOneAssets = getCapitalOne(mail)
 totalAssets = {**bofaAssets, **capitalOneAssets, **ASSETS}
 totalAssets["Stocks"] = getStockAssets()
 
-
-for (account,balance) in totalAssets.items():
-    print(str(balance)+" in "+account)
-print()
-print("Total: "+str(round(sum(totalAssets.values()),2)))
+if len(sys.argv) == 0:
+    print(datetime.today())
+    for (account,balance) in totalAssets.items():
+        print(str(balance)+" in "+account)
+    print("Total: "+str(round(sum(totalAssets.values()),2)))
+elif sys.argv[1] == "total":
+    print("$"+str(int(sum(totalAssets.values()))))
