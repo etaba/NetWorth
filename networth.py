@@ -1,9 +1,42 @@
-import imaplib, json, requests, sys
-from datetime import datetime
+import imaplib, json, requests, sys, collections, sqlite3
+
 from config import *
+from datetime import datetime, timedelta
+from multiprocessing.dummy import Pool
 
 CAPITALONE_SUBJECT = "Your requested balance summary"
 BOFA_SUBJECT =  "Your Available Balance"
+DB_FILE = "stocks.sql"
+
+def initDb():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT 1 FROM sqlite_master WHERE type="table" AND name="stock"')
+    if len(c.fetchall()) == 0:
+        c.execute('CREATE TABLE stock(ticker, insertDate, currVal, openPrice)')
+    conn.commit()
+    conn.close()
+
+def insertStock(ticker,currVal,openPrice):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        qry = 'UPDATE stock SET insertDate = DATE("now", "localtime"), currVal = {}, openPrice = {} WHERE ticker="{}"'
+        c.execute(qry)
+    except Exception:
+        qry = 'INSERT INTO stock (ticker, insertDate, currVal, openPrice) VALUES ("{}",DATE("now", "localtime"),{},{})'.format(ticker, currVal, openPrice)
+        c.execute(qry)
+    conn.commit()
+    conn.close()
+
+def getCachedStock(ticker):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    qry = 'SELECT * FROM stock WHERE ticker = "{}"'.format(ticker)
+    c.execute(qry)
+    stocks = c.fetchall()
+    price = collections.namedtuple('price','ticker insertDate currVal openPrice')
+    return price(*stocks[0])
 
 
 #Bank of America accounts
@@ -48,37 +81,97 @@ def getCapitalOne(mail):
         assets["CapitalOne"] = -1*balance
     return assets
 
+def dailyTotal(stock):
+    ticker = stock["1. symbol"]
+    openPrice = getOpenPrice(ticker)
+    currPrice = float(stock["2. price"])
+    insertStock(ticker,currPrice,openPrice)
+    return (currPrice * STOCKS[ticker], (currPrice - openPrice) * STOCKS[ticker])
+
+def getOpenPrice(ticker):
+    detailsUrl = "https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={0}&apikey={1}".format(ticker,STOCK_API_KEY)
+    response = requests.get(detailsUrl)
+    data = json.loads(response.content)
+    return float(data["Time Series (Daily)"][lastClose()]["4. close"])
+
+def dailyPercent(ticker):
+    url = "https://www.alphavantage.co/query?function=BATCH_STOCK_QUOTES&symbols={0}&apikey={1}".format(ticker,STOCK_API_KEY)
+    response = requests.get(url)
+    result = json.loads(response.content)
+    currPrice = float(result["Stock Quotes"][0]["2. price"])
+    openPrice = getOpenPrice(ticker)
+    insertStock(ticker,currPrice,openPrice)
+    return round(100*(currPrice - openPrice)/openPrice,2)
+
 #stocks
-def getStockAssets():
-    balance = 0
-    url = "https://www.alphavantage.co/query?function=BATCH_STOCK_QUOTES&symbols={0}&apikey={1}".format(",".join(STOCKS.keys()),STOCK_API_KEY,)
+def liveStockAssets():
+    url = "https://www.alphavantage.co/query?function=BATCH_STOCK_QUOTES&symbols={0}&apikey={1}".format(",".join(STOCKS.keys()),STOCK_API_KEY)
     response = requests.get(url)
     prices = json.loads(response.content)
-    for stocks in prices["Stock Quotes"]:
-        balance += float(stocks["2. price"]) * STOCKS[stocks["1. symbol"]]
-    if len(prices["Stock Quotes"]) != len(STOCKS.keys()):
-        print("Some stock prices not found:")
-        pricesFound = set([detail["1. symbol"] for detail in prices["Stock Quotes"]])
-        stocksNotFound = set(STOCKS.keys()) - pricesFound
-        [print(stock+" ("+str(STOCKS[stock])+" shares)") for stock in stocksNotFound]
-        print()
-    return round(balance,2)
+    results = prices["Stock Quotes"]
+    '''assets = [(stock["1. symbol"],float(stock["2. price"])*STOCKS[stock["1. symbol"]]) for stock in results]
+    balance = sum([asset[1] for asset in assets])'''
+    threadPool = Pool(5)
+    dailyTotals = threadPool.map(dailyTotal,results)
+    threadPool.close()
+    threadPool.join()
+    balance = int(sum([dt[0] for dt in dailyTotals]))
+    totalDayChange = int(sum([dt[1] for dt in dailyTotals]))
+    Result = collections.namedtuple("Result",["balance","dayChange"])
+    return Result(balance,totalDayChange)
+
+def cachedStockAssets():
+    prices = [getCachedStock(ticker) for ticker in STOCKS.keys()]
+    totalOpen = int(sum([price.openPrice*STOCKS[price.ticker] for price in prices]))
+    totalCurrent = int(sum([price.currVal*STOCKS[price.ticker] for price in prices]))
+    Result = collections.namedtuple("Result",["balance","dayChange"])
+    return Result(totalCurrent,totalCurrent - totalOpen)
 
 
-mail = imaplib.IMAP4_SSL('imap.gmail.com')
-mail.login(EMAIL_USERNAME, EMAIL_PASSWORD)
-mail.list()
-# Out: list of "folders" aka labels in gmail.
-mail.select("inbox") # connect to inbox.
-bofaAssets = getBofA(mail)
-capitalOneAssets = getCapitalOne(mail)
-totalAssets = {**bofaAssets, **capitalOneAssets, **ASSETS}
-totalAssets["Stocks"] = getStockAssets()
+def lastClose():
+    today = datetime.today()
+    if today.weekday == 6 or today.weekday == 1:
+        #find last friday
+        lastClose = today - timedelta(2 if today.weekday==7 else 3)
+    else:
+        lastClose = today - timedelta(1)
+    return lastClose.strftime('%Y-%m-%d')
 
-if len(sys.argv) == 0:
+if sys.argv[1] == "init":
+    initDb()
+
+elif sys.argv[1] == "net":
+    mail = imaplib.IMAP4_SSL('imap.gmail.com')
+    mail.login(EMAIL_USERNAME, EMAIL_PASSWORD)
+    mail.list()
+    # Out: list of "folders" aka labels in gmail.
+    mail.select("inbox") # connect to inbox.
+    bofaAssets = getBofA(mail)
+    capitalOneAssets = getCapitalOne(mail)
+    totalAssets = {**bofaAssets, **capitalOneAssets, **ASSETS}
+    totalAssets["Stocks"] = liveStockAssets().balance
+
     print(datetime.today())
     for (account,balance) in totalAssets.items():
         print(str(balance)+" in "+account)
     print("Total: "+str(round(sum(totalAssets.values()),2)))
-elif sys.argv[1] == "total":
-    print("$"+str(int(sum(totalAssets.values()))))
+
+elif sys.argv[1] == "daily":
+    try:
+        stockAssets = liveStockAssets()
+    except Exception:
+        stockAssets = cachedStockAssets()
+    if stockAssets.dayChange < 0:
+        print("-$"+str(-1 * stockAssets.dayChange))
+    else:
+        print("$"+str(stockAssets.dayChange))
+
+elif sys.argv[1] == "ticker":
+    ticker = sys.argv[2]
+    try:
+        change = dailyPercent(ticker)
+    except Exception:
+        cachedData = getCachedStock(ticker)
+        change = round(100*(cachedData[2] - cachedData[3])/cachedData[3],2)
+    print(str(change)+"% "+ticker)
+
